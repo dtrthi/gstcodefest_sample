@@ -1,10 +1,19 @@
 // Precondition: You need to require socket.io.js in your html page
 // Reference link https://socket.io
 // <script src="socket.io.js"></script>
+const {logger} = require('./logging.js');
 
-const apiServer = 'http://localhost:8888/';
-const gameId = '2f7c1a22-1ddc-444c-992a-ffc7b4c9876d';
-const playerId = 'player1-xxx';
+const TimeInOneCell = 500;
+const AroundPivotLimit = 10;
+
+const MapCell = {
+    Road: 0,
+    Wall: 1,
+    Balk: 2,
+    TeleportGate: 3,
+    QuarantinePlace: 4,
+    DragonEgg: 5,
+};
 
 const SpoilType = {
     Mystic: 6
@@ -19,12 +28,21 @@ function getPathFromRoot(node) {
 }
 
 class TreeNode {
-    constructor(val, dir, parent) {
+    constructor(val, dir = null, parent = null) {
         this.val = val;
         this.dir = dir;
         this.parent = parent;
         this.children = [];
         this.boxes = 0;
+        this.avoidThis = false;
+        this.attackThis = false;
+        if (parent) {
+            this.distance = parent.distance + 1;
+            this.bonusPoints = parent.bonusPoints;
+        } else {
+            this.distance = 0;
+            this.bonusPoints = 0;
+        }
     }
 }
 
@@ -40,7 +58,8 @@ class GamePlayer {
 }
 
 class GameMap {
-    constructor(playerId) {
+    constructor(socket, playerId) {
+        this.socket = socket;
         this.playerId = playerId;
         this.gameStart = false;
         this.tickId = 0;
@@ -54,8 +73,25 @@ class GameMap {
         this.eggs = new Set();
         this.bombSpots = new Set();
         this.bombDangers = new Set();
+        this.bombPositions = new Set();
+        this.rottenBoxes = new Set();
+
         this.gameLock = true;
         this.endGame = false;
+        this.roadMap = [];
+        this.runAwayPath = [];
+        this.destination = null;
+        this.destinationStart = Date.now();
+        this.destinationEnd = Date.now();
+        this.editableEggs = new Set();
+        this.freeWays = new Set();
+        this.pivotNode = null;
+
+        this.allLeaves = new Map();
+        this.gstTargets = [];
+
+        this.idleStart = Date.now();
+        this.alreadySignalStop = false;
 
         // game state
         this.avoidMystic = true;
@@ -70,32 +106,57 @@ class GameMap {
             if (this.gameLock === false) {
                 this.gameLock = true;
                 let startPosition = this.player.position;
-                if (this.canMove) {
-                    if (this.indanger) {
-                        this.gotoSafePlace();
-                    } else if (this.canBomb) {
-                        this.goBomb();
-                    } else if (this.haveEditableEggs) {
-                        this.goEatSomeEggs();
+                if (!this.destination) {
+                    this.updateDestination();
+                }
+                if (this.roadMap[0] === this.player.position) {
+                    logger.info(this.player.position);
+                    this.roadMap.shift();
+                    this.idleStart = Date.now();
+
+                    if (this.roadMap.length === 0) {
+                        logger.info('reach destination...');
+                        setTimeout(() => {
+                        this.destination = null;
+                        this.roadMap = [];
+                        this.runAwayPath = [];
+                        }, 50);
                     }
+                }
+
+                if (Date.now() - this.idleStart > TimeInOneCell) {
+                    logger.info('idling... reset the destination');
+                    this.destination = null;
+                    this.roadMap = [];
+                    this.runAwayPath = [];
+                }
+
+                const fallToBombSpot = this.roadMap.filter(
+                    c => this.bombSpots.has(c) && !this.runAwayPath.includes(c)
+                ).length > 0;
+                if (fallToBombSpot && !this.alreadySignalStop) {
+                    this.alreadySignalStop = true;
+                    logger.info('signal stop player...');
+                    this.socket.emit('drive player', {direction: 'x'});
                 }
                 this.gameLock = false;
             }
         }
 
-        setInterval(gameLoop, 100);
+        gameLoop();
     }
 
-    parseTicktack(id, mapInfo, res) {
+    parseTicktack(id, res) {
         //console.log(id, res);
+        const mapInfo = res.map_info;
         this.tickId = this.tickId + 1;
         this.map = mapInfo.map;
         this.flatMap = this.map.flat();
         this.mapWidth = mapInfo.size.cols;
         this.mapHeight = mapInfo.size.rows;
-        const currentPlayer = mapInfo.players.find(p => p.id === playerId);
+        const currentPlayer = mapInfo.players.find(p => p.id === this.playerId);
         this.player = new GamePlayer(this, currentPlayer);
-        const opponents = mapInfo.players.filter(p => p.id !== playerId);
+        const opponents = mapInfo.players.filter(p => p.id !== this.playerId);
         this.opponentPositions = new Set();
         for (let opponent of opponents) {
             const p = opponent.currentPosition;
@@ -105,10 +166,14 @@ class GameMap {
         for (let player of mapInfo.players) {
             this.playerMap.set(player.id, player);
         }
+        this.playerGst = null;
         this.targetGst = null;
         for (let gstEgg of mapInfo.dragonEggGSTArray) {
             if (gstEgg.id !== this.playerId) {
                 this.targetGst = this.to1dPos(gstEgg.col, gstEgg.row);
+            }
+            if (gstEgg.id === this.playerId) {
+                this.playerGst = this.to1dPos(gstEgg.col, gstEgg.row);
             }
         }
         this.mystics = new Set();
@@ -120,13 +185,18 @@ class GameMap {
                 this.eggs.add(this.to1dPos(spoil.col, spoil.row));
             }
         }
+        this.rottenBoxes = new Set();
         this.bombSpots = new Set();
+        this.bombDangers = new Set();
+        this.bombPositions = new Set();
         for (let bomb of mapInfo.bombs) {
             const bombPos = this.to1dPos(bomb.col, bomb.row);
-            this.bombSpots = new Set([
-                ...this.bombSpots,
-                ...this.getBombSpots(bombPos, bomb.playerId),
-        ]);
+            this.bombPositions.add(bombPos);
+            const bombSpots = this.getBombSpots(bombPos, bomb.playerId);
+            this.bombSpots = new Set([...this.bombSpots, ...bombSpots]);
+            if (bomb.remainTime < 1000) {
+                this.bombDangers = new Set([...this.bombDangers, ...bombSpots]);
+            }
         }
 
         // update game state
@@ -136,22 +206,179 @@ class GameMap {
         }
         const playerPosition = this.player.position;
         this.indanger = this.bombSpots.has(playerPosition);
-        this.canBomb = mapInfo.bombs.filter(b => b.playerId === this.playerId).length === 0;
+        const canBomb = mapInfo.bombs.filter(b => b.playerId === this.playerId).length === 0;
+        if (canBomb) {
+            this.canBomb = canBomb;
+        }
         this.haveEditableEggs = this.eggs.size > 0;
+        //this.endGame = this.flatMap.filter(c => c === 2).length <= 5;
         this.updateMap(res.tag, res.player_id);
 
         this.gameStart = true;
+
+        //
+        //this.checkFailToBombSpots();
+
+        this.editableEggs = new Set();
+        this.freeWays = new Set();
+        this.pivotNode = null;
+        this.readMap();
+        this.run();
+    }
+
+    updateDestination() {
+        const root = new TreeNode(this.player.position);
+        let [favNodes, gstEggs] = this.getPathWithoutMystic(this.player.position);
+        let targetNode = null;
+        let limit = 10;
+        for (let node of favNodes) {
+            if (!targetNode) {
+                targetNode = node;
+                continue;
+            }
+            const points = node.boxes + node.bonusPoints;
+            if ((targetNode.boxes + targetNode.bonusPoints) < points && (this.pivotNode || this.pivotNode.distance + AroundPivotLimit > node.distance)) {
+                targetNode = node;
+            }
+            if (--limit <= 0) {
+                break;
+            }
+        }
+        let pathToGSTEgg1 = null;
+        for (let node of gstEggs) {
+            pathToGSTEgg1 = node;
+            break;
+        }
+
+        let pathToGSTEgg2 = null;
+        [favNodes, gstEggs] = this.getPathIncludeMystic(this.player.position);
+        let targetNode2 = null;
+        limit = 10;
+        for (let node of favNodes) {
+            if (!targetNode2) {
+                targetNode2 = node;
+                console.info('target node 2 distance: ', targetNode2);
+                console.info('pivot node distance: ', this.pivotNode);
+                continue;
+            }
+            const points = node.boxes + node.bonusPoints;
+            if ((targetNode2.boxes + targetNode2.bonusPoints) < points && (!this.pivotNode || this.pivotNode.distance + AroundPivotLimit > node.distance)) {
+                targetNode2 = node;
+            }
+            if (--limit <= 0) {
+                break;
+            }
+        }
+        pathToGSTEgg2 = null;
+        for (let node of gstEggs) {
+            pathToGSTEgg2 = node;
+            break;
+        }
+
+        let standNode = null;
+        let runOverMystic = false;
+        if (targetNode) {
+            logger.info('target node distance: ' + targetNode.distance);
+        }
+        if (targetNode2) {
+            logger.info('target node 2 distance: ' + targetNode2.distance);
+        }
+        if (targetNode && (!this.pivotNode || targetNode.distance < this.pivotNode.distance + AroundPivotLimit)) {
+            standNode = targetNode;
+            runOverMystic = false;
+        } else if (targetNode2 && (!this.pivotNode || targetNode2.distance < this.pivotNode.distance + AroundPivotLimit)) {
+            standNode = targetNode2;
+            runOverMystic = true;
+        } else if (pathToGSTEgg1 && (!this.pivotNode || pathToGSTEgg1.distance < this.pivotNode.distance + AroundPivotLimit)) {
+            runOverMystic = false;
+            standNode = pathToGSTEgg1;
+        } else if (pathToGSTEgg2 && (!this.pivotNode || pathToGSTEgg2.distance < this.pivotNode.distance + AroundPivotLimit)) {
+            standNode = pathToGSTEgg2;
+            runOverMystic = true;
+        }
+
+        if (standNode) {
+            const node = new TreeNode(standNode.val);
+            let extendNode = this.getAvoidBomb(node, this.flatMap, new Set([
+                ...this.getBombSpots(standNode.val, this.playerId),
+                ...this.bombSpots,
+            ]), runOverMystic);
+            if (extendNode) {
+                const extendPath = getPathFromRoot(extendNode);
+                const direction = getPathFromRoot(standNode);
+                logger.info('direction ' + direction + ' ' + extendPath);
+                const lastPathLen = (direction + extendPath).length;
+                this.drivePlayer(direction + 'b' + extendPath);
+
+                this.updateDriverMap([extendNode, standNode]);
+                this.updateRunAwayPath([extendNode]);
+            }
+        }
+    }
+
+    updateDriverMap(nodes) {
+        this.roadMap = [];
+        this.destination = null;
+        for (let node of nodes) {
+            if (!this.destination) {
+                this.destination = node.val;
+            }
+            let n = node;
+            while (n) {
+                this.roadMap.unshift(n.val);
+                n = n.parent;
+            }
+        }
+    }
+
+    updateRunAwayPath(nodes) {
+        this.runAwayPath = [];
+        for (let node of nodes) {
+            let n = node;
+            while (n) {
+                this.runAwayPath.unshift(n.val);
+                n = n.parent;
+            }
+        }
+    }
+
+    readMap() {
+        const startPosition = this.player.position;
+        this.scanStaticMap(startPosition, this.flatMap);
+    }
+
+    checkFailToBombSpots() {
+        const dangerSpots = this.roadMap.filter(c => this.bombSpots.has(c));
+        if (dangerSpots.length) {
+            this.haltSignal = true;
+            this.socket.emit('drive player', { direction: 'x' });
+        }
+    }
+
+    onPlayerStop() {
+        console.log('on player stop');
+        this.alreadySignalStop = false;
     }
 
     updateMap(tag, player_id) {
         if (player_id === this.playerId) {
-            console.log(tag);
+            //console.log(tag);
             if (tag === 'player:stop-moving') {
                 //if (this.canMoveHandler) {
                 //    clearTimeout(this.canMoveHandler);
                 //    this.canMoveHandler = null;
                 //}
                 //this.canMove = true;
+            } else if (tag === 'player:moving-banned') {
+                if (this.canMoveHandler) {
+                    clearTimeout(this.canMoveHandler);
+                    this.canMoveHandler = null;
+                }
+                this.canMove = true;
+            } else if (tag === 'bomb:setup') {
+                this.canBomb = false;
+                const delay = this.player?.playerInfo?.delay ?? 2000;
+                setTimeout(() => this.canBomb = true, delay + 50);
             }
         }
     }
@@ -173,75 +400,70 @@ class GameMap {
         const root = new TreeNode(this.player.position, null, null);
         let path = this.getAvoidBomb(root, this.flatMap, this.bombSpots);
         if (path) {
-            //console.log('extend path', extendPath);
             path = getPathFromRoot(path);
-        } else {
-            path = '';
+            this.drivePlayer(path);
         }
-        //for (let [pos, leaf] of allLeaves) {
-        socket.emit('drive player', { direction: path });
-        const pathLen = path.length;
-        this.canMove = false;
-        this.canMoveHandler = setTimeout(() => this.canMove = true, 400 * pathLen);
     }
 
     goBomb() {
         const root = new TreeNode(this.player.position, null, null);
-        const allLeaves = this.getAllLeaves(root, this.flatMap);
-        let pos, leaf;
+        this.getAllLeaves(root, this.flatMap);
         let rickLeaf = null;
         let limit = 10;
-        for ([pos, leaf] of allLeaves) {
-            if (!rickLeaf || rickLeaf.boxes < leaf.boxes) {
+        for (let [pos, leaf] of this.allLeaves) {
+            const points = leaf.boxes + leaf.bonusPoints;
+            if (!rickLeaf || (rickLeaf.boxes + rickLeaf.bonusPoints) < points) {
                 rickLeaf = leaf;
             }
             if (--limit <= 0) {
                 break;
             }
         }
+        let pathToGSTEgg = null;
+        for (let node of this.gstTargets) {
+            pathToGSTEgg = node;
+            break;
+        }
         let extendPath;
+        let standNode = null;
         if (rickLeaf) {
-            const node = new TreeNode(rickLeaf.val, null, null);
+            standNode = rickLeaf;
+        } else if (pathToGSTEgg) {
+            standNode = pathToGSTEgg;
+        }
+        if (standNode) {
+            const node = new TreeNode(standNode.val, null, null);
             extendPath = this.getAvoidBomb(node, this.flatMap, new Set([
-                ...this.getBombSpots(rickLeaf.val, this.playerId),
+                ...this.getBombSpots(standNode.val, this.playerId),
                 ...this.bombSpots,
             ]));
-        }
-        if (extendPath) {
-            //console.log('extend path', extendPath);
-            extendPath = getPathFromRoot(extendPath);
-        } else {
-            extendPath = '';
-        }
-        //for (let [pos, leaf] of allLeaves) {
-        if (rickLeaf) {
-            const direction = getPathFromRoot(rickLeaf);
-            console.log('direction', direction, extendPath);
-            const lastPathLen = (direction + extendPath).length;
-            socket.emit('drive player', { direction: direction + 'b' + extendPath });
-            this.canMove = false;
-            this.canMoveHandler = setTimeout(() => this.canMove = true, 400 * lastPathLen);
+            if (extendPath) {
+                extendPath = getPathFromRoot(extendPath);
+                const direction = getPathFromRoot(standNode);
+                console.log('direction', direction, extendPath);
+                const lastPathLen = (direction + extendPath).length;
+                this.drivePlayer(direction + 'b' + extendPath);
+            }
         }
     }
 
     goEatSomeEggs() {
         console.log('Go eat some eggs');
         const root = new TreeNode(this.player.position, null, null);
-        let path = this.getEdiableEggsPath(root, this.flatMap);
-        if (path) {
+        let node = this.getEdiableEggsPath(root, this.flatMap);
+        let path = '';
+        if (node) {
             //console.log('extend path', extendPath);
-            path = getPathFromRoot(path);
-        } else {
-            path = '';
+            path = getPathFromRoot(node);
         }
         const pathLen = path.length;
         if (!this.endGame && pathLen > 5) {
             return;
         }
         //for (let [pos, leaf] of allLeaves) {
-        socket.emit('drive player', { direction: path });
-        this.canMove = false;
-        this.canMoveHandler = setTimeout(() => this.canMove = true, 400 * pathLen);
+        if (path) {
+            this.drivePlayer(path);
+        }
     }
 
     getBombSpots(pos, playerId) {
@@ -250,39 +472,21 @@ class GameMap {
         if (player) {
             playerPower = player.power;
         }
-        const passThroughCells = new Set([0, 3]);
+        const passThroughCells = new Set([MapCell.Road, MapCell.TeleportGate]);
         const bombSpots = new Set([pos]);
-        for (let i = 1; i <= playerPower; i++) {
-            const p = pos - i;
-            const cellType = this.flatMap[p];
-            if (!passThroughCells.has(cellType)) {
-                break;
+        const allDirections = [-1, 1, -this.mapWidth, this.mapWidth];
+        for (let d of allDirections) {
+            for (let i = 1; i <= playerPower; i++) {
+                const p = pos + d * i;
+                const cellType = this.flatMap[p];
+                if (!passThroughCells.has(cellType)) {
+                    if (cellType === MapCell.Balk) {
+                        this.rottenBoxes.add(p);
+                    }
+                    break;
+                }
+                bombSpots.add(p);
             }
-            bombSpots.add(p);
-        }
-        for (let i = 1; i <= playerPower; i++) {
-            const p = pos + i;
-            const cellType = this.flatMap[p];
-            if (!passThroughCells.has(cellType)) {
-                break;
-            }
-            bombSpots.add(p);
-        }
-        for (let i = 1; i <= playerPower; i++) {
-            const p = pos - this.mapWidth * i;
-            const cellType = this.flatMap[p];
-            if (!passThroughCells.has(cellType)) {
-                break;
-            }
-            bombSpots.add(p);
-        }
-        for (let i = 1; i <= playerPower; i++) {
-            const p = pos + this.mapWidth * i;
-            const cellType = this.flatMap[p];
-            if (!passThroughCells.has(cellType)) {
-                break;
-            }
-            bombSpots.add(p);
         }
 
         return bombSpots;
@@ -303,134 +507,127 @@ class GameMap {
         const playerPower = this.playerMap.get(this.playerId).power;
         let box1 = 0, box2 = 0, box3 = 0, box4 = 0;
         let boxes = 0;
-        for (let i = 1; i <= playerPower; i++) {
-            let cellType = this.flatMap[loc - i];
-            if (cellType === 1 || cellType === 5) {
-                break;
-            }
-            if (cellType === 2) {
-                box1 = 1;
-                boxes += 1;
-                break;
-            }
-        }
-        for (let i = 1; i <= playerPower; i++) {
-            let cellType = this.flatMap[loc + i];
-            if (cellType === 1 || cellType === 5) {
-                break;
-            }
-            if (cellType === 2) {
-                box2 = 1;
-                boxes += 1;
-                break;
-            }
-        }
-        for (let i = 1; i <= playerPower; i++) {
-            let cellType = this.flatMap[loc - i * this.mapWidth];
-            if (cellType === 1 || cellType === 5) {
-                break;
-            }
-            if (cellType === 2) {
-                box3 = 1;
-                boxes += 1;
-                break;
+        const allDirections = [-1, 1, -this.mapWidth, this.mapWidth];
+        for (let d of allDirections) {
+            for (let i = 1; i <= playerPower; i++) {
+                const p = loc + d * i;
+                let cellType = this.flatMap[p];
+                if (cellType === MapCell.Wall) {
+                    break;
+                }
+                if (cellType === MapCell.DragonEgg) {
+                    if (p === this.playerGst) {
+                        node.avoidThis = true;
+                    }
+                    if (p === this.targetGst) {
+                        node.attackThis = true;
+                    }
+                    break;
+                }
+                if (cellType === MapCell.Balk && !this.rottenBoxes.has(p)) {
+                    boxes += 1;
+                    break;
+                }
             }
         }
-        for (let i = 1; i <= playerPower; i++) {
-            let cellType = this.flatMap[loc + i * this.mapWidth];
-            if (cellType === 1 || cellType === 5) {
-                break;
-            }
-            if (cellType === 2) {
-                box4 = 1;
-                boxes += 1;
-                break;
-            }
-        }
-
         node.boxes = boxes;
     }
 
     getAllLeaves(startNode, map) {
-        const allLeaves = new Map();
+        this.allLeaves = new Map();
+        this.gstTargets = [];
 
-        const queue = [startNode];
-        const visited = new Set([startNode.val]);
-        while (queue.length) {
-            const currentNode = queue.shift();
-
+        this.scanMap(startNode, map, (currentNode) => {
+            if (this.bombSpots.has(currentNode.val)) {
+                return [null, true];
+            }
+            if (this.eggs.has(currentNode.val)) {
+                currentNode.bonusPoints += 1;
+            }
             this.countBoxHits(currentNode);
-            if (currentNode.boxes > 0) {
-                allLeaves.set(currentNode.val, currentNode);
+            if (currentNode.boxes > 0 && !currentNode.avoidThis) {
+                this.allLeaves.set(currentNode.val, currentNode);
             }
-            const neighbors = this.getNeighborNodes(currentNode.val);
-
-            for (let idx in neighbors) {
-                const neighbor = neighbors[idx];
-                const cellValue = map[neighbor];
-                if (cellValue === 0) {
-                    //console.log('get cell can move', neighbor);
-                    if (this.opponentPositions.has(neighbor)) {
-                        visited.add(neighbor);
-                    }
-                    if (this.mystics.has(neighbor)) {
-                        visited.add(neighbor);
-                    }
-                    if (!visited.has(neighbor)) {
-                        const dir = parseInt(idx, 10) + 1;
-                        const neighborNode = new TreeNode(neighbor, dir.toString(), currentNode);
-                        currentNode.children.push(neighborNode);
-                        queue.push(neighborNode);
-                        visited.add(neighbor);
-                    }
-                }
+            if (currentNode.attackThis) {
+                this.gstTargets.push(currentNode);
             }
-        }
 
-        return allLeaves;
+            return [null, false];
+        });
     }
 
-    getAvoidBomb(startNode, map, bombHoles) {
-        const queue = [startNode];
-        const visited = new Set([startNode.val]);
-        while (queue.length) {
-            const currentNode = queue.shift();
+    getAvoidBomb(startNode, map, bombSpots, runOverMystic = false) {
+        const goodSpots = new Set();
+        let limit = 20;
+        this.scanMap(startNode, map, (currentNode) => {
+            if (!bombSpots.has(currentNode.val)) {
+                if (this.eggs.has(currentNode.val)) {
+                    currentNode.bonusPoints += 1;
+                }
+                this.countBoxHits(currentNode);
+                const isGoodSpot1 = currentNode.boxes > 0 && !currentNode.avoidThis;
+                const isGoodSpot2 = currentNode.attackThis;
 
-            const neighbors = this.getNeighborNodes(currentNode.val);
+                if (goodSpots.size === 0 || isGoodSpot1 || isGoodSpot2) {
+                    goodSpots.add(currentNode);
+                }
 
-            for (let idx in neighbors) {
-                const neighbor = neighbors[idx];
-                const cellValue = map[neighbor];
-                if (cellValue === 0) {
-                    //console.log('get cell can move', neighbor);
-                    if (this.opponentPositions.has(neighbor)) {
-                        visited.add(neighbor);
-                    }
-                    if (this.mystics.has(neighbor)) {
-                        visited.add(neighbor);
-                    }
-                    if (!visited.has(neighbor)) {
-                        visited.add(neighbor);
-                        const dir = parseInt(idx, 10) + 1;
-                        const neighborNode = new TreeNode(neighbor, dir.toString(), currentNode);
-                        currentNode.children.push(neighborNode);
-                        queue.push(neighborNode);
-                        if (!bombHoles.has(neighbor)) {
-                            return neighborNode;
-                        }
-                    }
+                if (--limit <= 0) {
+                    return [true, false];
                 }
             }
-        }
+            return [null, false];
+        }, runOverMystic);
 
-        return null;
+        let goodSpot = null;
+        let foundOpponentEgg = false;
+        for (let spot of goodSpots) {
+            if (!foundOpponentEgg && spot.attackThis) {
+                foundOpponentEgg = true;
+                goodSpot = spot;
+                continue;
+            }
+            if (!goodSpot) {
+                goodSpot = spot;
+                continue;
+            }
+            const points = spot.boxes + spot.bonusPoints;
+            if ((goodSpot.boxes + goodSpot.bonusPoints) < points) {
+            }
+        }
+        console.log('count good spots', goodSpots.size);
+        return goodSpot;
     }
 
     getEdiableEggsPath(startNode, map) {
+        return this.scanMap(startNode, map, (currentNode) => {
+            if (this.bombSpots.has(currentNode.val)) {
+                return [null, true];
+            }
+            if (this.eggs.has(currentNode.val)) {
+                return [currentNode, false];
+            }
+            return [null, false];
+        });
+
+        return null;
+    }
+
+    scanMap(startNode, map, callback, runOverMystic = false) {
         const queue = [startNode];
         const visited = new Set([startNode.val]);
         while (queue.length) {
             const currentNode = queue.shift();
+
+            if (callback) {
+                const [r, ignoreThisNode] = callback(currentNode);
+                if (ignoreThisNode) {
+                    continue;
+                }
+                if (r) {
+                    return r;
+                }
+            }
 
             const neighbors = this.getNeighborNodes(currentNode.val);
 
@@ -442,21 +639,18 @@ class GameMap {
                     if (this.opponentPositions.has(neighbor)) {
                         visited.add(neighbor);
                     }
-                    if (this.mystics.has(neighbor)) {
+                    if (!runOverMystic && this.mystics.has(neighbor)) {
                         visited.add(neighbor);
                     }
-                    if (this.bombSpots.has(neighbor)) {
+                    if (this.bombDangers.has(neighbor)) {
                         visited.add(neighbor);
                     }
                     if (!visited.has(neighbor)) {
                         visited.add(neighbor);
                         const dir = parseInt(idx, 10) + 1;
-                        const neighborNode = new TreeNode(neighbor, dir.toString(), currentNode);
+                        const neighborNode = new TreeNode(neighbor, dir.toString(), currentNode, currentNode.bonusPoints);
                         currentNode.children.push(neighborNode);
                         queue.push(neighborNode);
-                        if (this.eggs.has(neighbor)) {
-                            return neighborNode;
-                        }
                     }
                 }
             }
@@ -464,93 +658,166 @@ class GameMap {
 
         return null;
     }
+
+    scanMapIncludeMystic(startNode, map, callback) {
+        const queue = [startNode];
+        const visited = new Set([startNode.val]);
+        while (queue.length) {
+            const currentNode = queue.shift();
+
+            if (callback) {
+                const [r, ignoreThisNode] = callback(currentNode);
+                if (ignoreThisNode) {
+                    continue;
+                }
+                if (r) {
+                    return r;
+                }
+            }
+
+            const neighbors = this.getNeighborNodes(currentNode.val);
+
+            for (let idx in neighbors) {
+                const neighbor = neighbors[idx];
+                const cellValue = map[neighbor];
+                if (cellValue === 0) {
+                    //console.log('get cell can move', neighbor);
+                    if (this.opponentPositions.has(neighbor)) {
+                        visited.add(neighbor);
+                    }
+                    if (this.bombDangers.has(neighbor)) {
+                        visited.add(neighbor);
+                    }
+                    if (!visited.has(neighbor)) {
+                        visited.add(neighbor);
+                        const dir = parseInt(idx, 10) + 1;
+                        const neighborNode = new TreeNode(neighbor, dir.toString(), currentNode, currentNode.bonusPoints);
+                        currentNode.children.push(neighborNode);
+                        queue.push(neighborNode);
+                    }
+                }
+            }
+        }
+
+        return null;
+    }
+
+    scanStaticMap(position, map) {
+        const startNode = new TreeNode(position, null, null);
+        const queue = [startNode];
+        const visited = new Set([position]);
+        while (queue.length) {
+            const currentNode = queue.shift();
+            const p = currentNode.val;
+            this.scanThisNode(currentNode);
+
+            const neighbors = this.getNeighborNodes(p);
+            for (let idx in neighbors) {
+                const neighbor = neighbors[idx];
+                const cellValue = map[neighbor];
+                if (cellValue === MapCell.Road) {
+                    if (!visited.has(neighbor)) {
+                        visited.add(neighbor);
+                        const dir = parseInt(idx, 10) + 1;
+                        const neighborNode = new TreeNode(neighbor, dir.toString(), currentNode);
+                        currentNode.children.push(neighborNode);
+                        queue.push(neighborNode);
+                    }
+                }
+            }
+        }
+
+        return null;
+    }
+
+    getPathWithoutMystic(position) {
+        const favNodes = [];
+        const gstEggs = [];
+        const startNode = new TreeNode(position);
+        this.scanMap(startNode, this.flatMap, (currentNode) => {
+            if (this.bombSpots.has(currentNode.val)) {
+                return [null, true];
+            }
+            if (this.eggs.has(currentNode.val)) {
+                currentNode.bonusPoints += 1;
+            }
+            if (!this.freeWays.has(currentNode.val)) {
+                this.countBoxHits(currentNode);
+                if (currentNode.boxes > 0 && !currentNode.avoidThis) {
+                    favNodes.push(currentNode);
+                }
+                if (currentNode.attackThis) {
+                    gstEggs.push(currentNode);
+                }
+            }
+
+            return [null, false];
+        });
+
+        return [favNodes, gstEggs];
+    }
+
+    getPathIncludeMystic(position) {
+        const favNodes = [];
+        const gstEggs = [];
+        const startNode = new TreeNode(position);
+        this.scanMapIncludeMystic(startNode, this.flatMap, (currentNode) => {
+            //console.log('current noe', currentNode);
+            if (this.bombSpots.has(currentNode.val)) {
+                return [null, true];
+            }
+            if (this.eggs.has(currentNode.val)) {
+                currentNode.bonusPoints += 1;
+            }
+            if (!this.freeWays.has(currentNode.val)) {
+                this.countBoxHits(currentNode);
+                if (currentNode.boxes > 0 && !currentNode.avoidThis) {
+                    favNodes.push(currentNode);
+                }
+                if (currentNode.attackThis) {
+                    gstEggs.push(currentNode);
+                }
+            }
+
+            return [null, false];
+        });
+
+        return [favNodes, gstEggs];
+    }
+
+    scanThisNode(node) {
+        this.countBoxHits(node);
+        if (node.boxes === 0 && !node.attackThis) {
+            this.freeWays.add(node.val);
+        }
+        if (node.boxes && !this.pivotNode) {
+            this.pivotNode = node;
+        }
+        if (this.eggs.has(node.val)) {
+            this.editableEggs.add(node.val);
+        }
+    }
+
+    drivePlayer(path, node) {
+        const pathLen = path.split('').filter(c => c !== 'b').length;
+        this.socket.emit('drive player', { direction: path });
+        this.canMove = false;
+        this.canMoveHandler = setTimeout(() => this.canMove = true, 250 * pathLen);
+    }
+
+    storeRoadMap(node) {
+        this.roadMap = [];
+        if (node) {
+            this.destination = node.val;
+        } else {
+            console.trace();
+        }
+        this.destinationStart = Date.now();
+        while (node) {
+            this.roadMap.unshift(node.val);
+            node = node.parent;
+        }
+    }
 }
 
-const gameMap = new GameMap(playerId);
-gameMap.run();
-const global = {
-    ticktack: false,
-    ticktackTimeoutId: null,
-    isTicktack: true,
-    mapInfo: null,
-    map: [],
-    mapSize: [0, 0],
-    lastPos: 0,
-    currentPlayerPosition: 0,
-    isIdle: false,
-    lastRun: false,
-    opponentPositions: [],
-    walkTime: 400,
-    lastPathLen: 0,
-    avoidNodes: new Set(),
-    eggs: new Set(),
-    bombPaths: new Set(),
-};
-
-// Connecto to API App server
-console.log('Server URL: %s', apiServer);
-console.log('gameId: %s', gameId);
-console.log('playerId: %s', playerId);
-const socket = io.connect(apiServer, { reconnect: true, transports: ['websocket'] });
-
-
-// LISTEN SOCKET.IO EVENTS
-
-// It it required to emit `join channel` event every time connection is happened
-socket.on('connect', () => {
-    document.getElementById('connected-status').innerHTML = 'ON';
-    document.getElementById('socket-status').innerHTML = 'Connected';
-    console.log('[Socket] connected to server');    
-    // API-1a
-    socket.emit('join game', { game_id: gameId, player_id: playerId });
-});
-
-socket.on('disconnect', () => {
-    console.warn('[Socket] disconnected');
-    document.getElementById('socket-status').innerHTML = 'Disconnected';
-});
-
-socket.on('connect_failed', () => {
-    console.warn('[Socket] connect_failed');
-    document.getElementById('socket-status').innerHTML = 'Connected Failed';
-});
-
-
-socket.on('error', (err) => {
-    console.error('[Socket] error ', err);
-    document.getElementById('socket-status').innerHTML = 'Error!';
-});
-
-
-// SOCKET EVENTS
-
-// API-1b
-socket.on('join game', (res) => {
-    console.log('[Socket] join-game responsed', res);
-    document.getElementById('joingame-status').innerHTML = 'ON';
-});
-
-//API-2
-socket.on('ticktack player', (res) => {
-    //console.info('> ticktack');
-    //console.log('[Socket] ticktack-player responsed, map_info: ', res.map_info);
-    document.getElementById('ticktack-status').innerHTML = 'ON';
-
-    gameMap.parseTicktack(res.id, res.map_info, res);
-});
-
-// API-3a
-// socket.emit('drive player', { direction: '111b333222' });
-
-//API-3b
-socket.on('drive player', (res) => {
-    console.log('[Socket] drive-player responsed, res: ', res);
-});
-
-const input = document.querySelector('#input');
-const sendBtn = document.querySelector('#send');
-
-sendBtn.addEventListener('click', () => {
-    const direction = input.value;
-    socket.emit('drive player', { direction: direction });
-});
+exports.GameMap = GameMap;
