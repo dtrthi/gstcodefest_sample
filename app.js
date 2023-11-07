@@ -60,6 +60,7 @@ socket.on('error', (err) => {
 
 socket.on('join game', (res) => {
     console.log('[Socket] join-game responsed', res);
+    gameMap.onJoinGame(res);
 });
 
 //API-2
