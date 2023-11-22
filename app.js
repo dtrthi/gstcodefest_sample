@@ -11,6 +11,9 @@ const playerId = 'player1-xxx';
 
 const socket = io('http://127.0.0.1:8888/');
 
+//var indexRouter = require('./routes/index');
+//var usersRouter = require('./routes/users');
+
 var app = express();
 
 // view engine setup
@@ -22,6 +25,9 @@ app.use(express.json());
 app.use(express.urlencoded({ extended: false }));
 app.use(cookieParser());
 app.use(express.static(path.join(__dirname, 'public')));
+
+//app.use('/', indexRouter);
+//app.use('/users', usersRouter);
 
 // catch 404 and forward to error handler
 app.use(function(req, res, next) {
@@ -39,6 +45,7 @@ app.use(function(err, req, res, next) {
 });
 
 const gameMap = new GameMap(socket, playerId);
+//gameMap.run();
 
 socket.on('connect', () => {
   console.log(`Socket connect ${socket.id}`);
@@ -60,6 +67,7 @@ socket.on('error', (err) => {
 
 socket.on('join game', (res) => {
     console.log('[Socket] join-game responsed', res);
+    gameMap.onJoinGame(res);
 });
 
 //API-2
@@ -70,7 +78,9 @@ socket.on('ticktack player', (res) => {
 });
 
 socket.on('drive player', (res) => {
-    res.player_id === playerId && console.log('[Socket] drive-player responsed, res: ', res);
+    //res.player_id === playerId && console.log('[Socket] drive-player responsed, res: ', res);
+    console.log('[Socket] drive-player responsed, res: ', res);
+    gameMap.onPlayerStop(res);
 });
 
 module.exports = app;
