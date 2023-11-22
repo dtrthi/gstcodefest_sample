@@ -346,6 +346,12 @@ class GameMap {
         }
     }
 
+    onJoinGame(res) {
+        if (this.playerId.includes(res.player_id)) {
+            this.playerId = res.player_id;
+        }
+    }
+
     to2dPos(pos) {
         const cols = this.mapWidth;
         const y = Math.floor(pos / cols);
