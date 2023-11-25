@@ -78,9 +78,8 @@ socket.on('ticktack player', (res) => {
 });
 
 socket.on('drive player', (res) => {
-    //console.log('[Socket] drive-player responsed, res: ', res);
     //res.player_id === playerId && console.log('[Socket] drive-player responsed, res: ', res);
-    //console.log('[Socket] drive-player responsed, res: ', res);
+    console.log('[Socket] drive-player responsed, res: ', res);
     gameMap.onPlayerStop(res);
 });
 

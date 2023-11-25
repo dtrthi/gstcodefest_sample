@@ -342,7 +342,6 @@ class GameMap {
                 this.canBomb = false;
                 //const delay = 2000; //this.player?.playerInfo?.delay ?? 2000;
                 const delay = this.player?.playerInfo?.delay ?? 2000;
-                //setTimeout(() => this.canBomb = true, delay + 50);
                 setTimeout(() => this.canBomb = true, delay);
             }
         } else if (!this.playerId.includes(player_id)) {
@@ -351,6 +350,12 @@ class GameMap {
                 //this.haltSignal = true;
                 //this.socket.emit('drive player', { direction: 'x' });
             }
+        }
+    }
+
+    onJoinGame(res) {
+        if (this.playerId.includes(res.player_id)) {
+            this.playerId = res.player_id;
         }
     }
 
@@ -424,8 +429,6 @@ class GameMap {
                 this.storeRoadMap([extendPath, standNode]);
                 //this.canBomb = false;
             }
-        } else {
-            this.goToGoodSpot();
         }
     }
 
@@ -1065,8 +1068,8 @@ class GameMap {
     checkForSpecialSpot(map) {
         for (let c in map) {
             const cellType = map[c];
-            //if (!AllCellTypes.has(cellType)) {
-            if (this.targetGst == c) {
+            if (!AllCellTypes.has(cellType)) {
+            //if (this.targetGst == c) {
                 this.specialSpot = parseInt(c, 10);
                 break;
             }
